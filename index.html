@@ -1,0 +1,1216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flowcast</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Sora:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #070b14; }
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.4); cursor: pointer; }
+    input[type="number"]::-webkit-inner-spin-button { opacity: 0.4; }
+    select option { background: #0a0e1c; color: #c8d6ea; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #1a2540; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+  const { useState, useMemo, useEffect, useRef } = React;
+  const { AreaChart, Area, XAxis, YAxis, Tooltip, ReferenceLine, ResponsiveContainer, CartesianGrid } = Recharts;
+
+  // ── Palette ──────────────────────────────────────────────────────────────────
+  const C = {
+    bg:"#070b14", surface:"#0d1220", card:"#111827", border:"#1a2540",
+    text:"#c8d6ea", muted:"#3d5070",
+    green:"#34d399", red:"#fb7185", amber:"#fbbf24", blue:"#60a5fa", indigo:"#818cf8",
+  };
+
+  // ── Date utils ───────────────────────────────────────────────────────────────
+  function todayStr() { return new Date().toISOString().split("T")[0]; }
+  function shiftDate(d, n) {
+    const dt = new Date(d + "T12:00:00Z");
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().split("T")[0];
+  }
+  function dowOf(d) { return new Date(d + "T12:00:00Z").getUTCDay(); }
+  function fmtDate(d) {
+    return new Date(d + "T12:00:00Z").toLocaleDateString("en-CA", { month:"short", day:"numeric", timeZone:"UTC" });
+  }
+  function fmtDateFull(d) {
+    return new Date(d + "T12:00:00Z").toLocaleDateString("en-CA", { month:"short", day:"numeric", year:"numeric", timeZone:"UTC" });
+  }
+  function fmtMonth(ym) {
+    const [y, m] = ym.split("-");
+    return new Date(+y, +m - 1, 1).toLocaleDateString("en-CA", { month:"short", year:"numeric" });
+  }
+  function fmtBal(n) {
+    return new Intl.NumberFormat("en-CA", { style:"currency", currency:"CAD", maximumFractionDigits:0 }).format(n);
+  }
+  function fmtDelta(n) { return (n >= 0 ? "+" : "") + fmtBal(n); }
+  function dayDiff(d1, d2) {
+    return Math.round((new Date(d2 + "T12:00:00Z") - new Date(d1 + "T12:00:00Z")) / 86400000);
+  }
+  // Days in a given month. y = full year, m = 1-indexed month.
+  function daysInMonth(y, m) { return new Date(y, m, 0).getDate(); }
+  function nextMonths(n) {
+    const out = []; const t = new Date();
+    for (let i = 0; i < n; i++) {
+      const d = new Date(t.getFullYear(), t.getMonth() + i, 1);
+      out.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`);
+    }
+    return out;
+  }
+  function daysAgo(iso) {
+    if (!iso) return null;
+    return Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+  }
+
+  // ── Recurrence engine ────────────────────────────────────────────────────────
+  // When a scheduled day (e.g. 31) doesn't exist in the current month, hit the
+  // last valid day of that month instead of silently skipping.
+  function hitsNaturally(item, dateStr) {
+    if (item.endDate && dateStr > item.endDate) return false;
+    const diff = dayDiff(item.nextDate, dateStr);
+    if (diff < 0) return false;
+    const [ny, nm, nd] = item.nextDate.split("-").map(Number);
+    const [dy, dm, dd]  = dateStr.split("-").map(Number);
+    const dim = daysInMonth(dy, dm);
+
+    function hitsDay(target) {
+      return dd === target || (target > dim && dd === dim);
+    }
+
+    switch (item.frequency) {
+      case "weekly":    return diff % 7 === 0;
+      case "biweekly":  return diff % 14 === 0;
+      case "bimonthly": {
+        const [d1, d2] = item.bimonthlyDays ?? [nd, nd <= 14 ? nd + 15 : nd - 14];
+        return hitsDay(d1) || hitsDay(d2);
+      }
+      case "monthly":   return hitsDay(nd);
+      case "quarterly": return ((dy*12+dm) - (ny*12+nm)) % 3 === 0 && hitsDay(nd);
+      case "annual":    return nm === dm && hitsDay(nd);
+      default:          return false;
+    }
+  }
+
+  function hitsOnDate(item, dateStr) {
+    if (!item.businessDay) return hitsNaturally(item, dateStr);
+    const dow = dowOf(dateStr);
+    if (dow === 0 || dow === 6) return false;
+    if (hitsNaturally(item, dateStr)) return true;
+    if (dow === 1) {
+      if (hitsNaturally(item, shiftDate(dateStr, -2))) return true;
+      if (hitsNaturally(item, shiftDate(dateStr, -1))) return true;
+    }
+    return false;
+  }
+
+  function amountOnDate(item, dateStr) {
+    if (!item.variable || !item.overrides?.length) return item.amount;
+    const ov = item.overrides.find(o => o.month === dateStr.slice(0, 7));
+    return ov !== undefined ? ov.amount : item.amount;
+  }
+
+  function buildForecast(bal, startDate, recurring, oneTime, days) {
+    const rows = []; let running = bal;
+    for (let i = 0; i <= days; i++) {
+      const date = shiftDate(startDate, i);
+      const events = [
+        ...recurring.filter(r => r.active && hitsOnDate(r, date))
+          .map(r => ({ name:r.name, amount:amountOnDate(r,date), variable:r.variable })),
+        ...oneTime.filter(o => o.date === date)
+          .map(o => ({ name:o.name, amount:o.amount })),
+      ];
+      running = Math.round((running + events.reduce((s,e) => s+e.amount, 0)) * 100) / 100;
+      rows.push({ date, balance:running, events });
+    }
+    return rows;
+  }
+
+  function uid() { return Math.random().toString(36).slice(2, 8); }
+
+  // ── localStorage ─────────────────────────────────────────────────────────────
+  function lsGet(key, fallback) {
+    try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
+    catch { return fallback; }
+  }
+  function lsSet(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch {} }
+
+  // ── Demo data ─────────────────────────────────────────────────────────────────
+  const DEMO_RECURRING = [
+    { id:"r1", name:"Paycheque",        amount: 4800, frequency:"biweekly",  nextDate:"2026-04-25", endDate:"", active:true,  businessDay:true,  bimonthlyDays:[1,15], variable:false, overrides:[] },
+    { id:"r2", name:"Mortgage",         amount:-2350, frequency:"monthly",   nextDate:"2026-05-01", endDate:"", active:true,  businessDay:false, bimonthlyDays:[1,15], variable:false, overrides:[] },
+    { id:"r3", name:"Credit card",      amount:-1800, frequency:"monthly",   nextDate:"2026-05-15", endDate:"", active:true,  businessDay:false, bimonthlyDays:[1,15], variable:true,  overrides:[{month:"2026-05",amount:-2100},{month:"2026-07",amount:-2400}] },
+    { id:"r4", name:"Costco",           amount: -310, frequency:"monthly",   nextDate:"2026-05-10", endDate:"", active:true,  businessDay:false, bimonthlyDays:[1,15], variable:true,  overrides:[] },
+    { id:"r5", name:"Hydro / Gas",      amount: -145, frequency:"monthly",   nextDate:"2026-05-10", endDate:"", active:true,  businessDay:false, bimonthlyDays:[1,15], variable:false, overrides:[] },
+    { id:"r6", name:"Car Insurance",    amount: -218, frequency:"monthly",   nextDate:"2026-05-05", endDate:"", active:true,  businessDay:false, bimonthlyDays:[1,15], variable:false, overrides:[] },
+    { id:"r7", name:"Phone & Internet", amount: -155, frequency:"monthly",   nextDate:"2026-05-08", endDate:"", active:true,  businessDay:false, bimonthlyDays:[1,15], variable:false, overrides:[] },
+    { id:"r8", name:"RESP",             amount: -200, frequency:"bimonthly", nextDate:"2026-05-01", endDate:"", active:true,  businessDay:false, bimonthlyDays:[1,15], variable:false, overrides:[] },
+  ];
+  const DEMO_ONETIME = [
+    { id:"o1", name:"Summer camp deposit",      amount: -650, date:"2026-05-03" },
+    { id:"o2", name:"Property tax installment", amount:-1100, date:"2026-06-15" },
+  ];
+  const FREQS = ["weekly","biweekly","bimonthly","monthly","quarterly","annual"];
+
+  // ── Validation ────────────────────────────────────────────────────────────────
+  function validateRecurring(d) {
+    const e = [];
+    if (!d.name.trim()) e.push("Name is required");
+    const a = parseFloat(d.amount);
+    if (d.amount === "" || isNaN(a)) e.push("Amount must be a number");
+    else if (a === 0) e.push("Amount cannot be zero");
+    if (!d.nextDate) e.push("Start date is required");
+    if (d.endDate && d.nextDate && d.endDate <= d.nextDate)
+      e.push("End date must be after start date");
+    if (d.frequency === "bimonthly" && d.bimonthlyDays) {
+      if (d.bimonthlyDays[0] === d.bimonthlyDays[1])
+        e.push("Bimonthly days must be different");
+    }
+    return e;
+  }
+  function validateOneTime(d) {
+    const e = [];
+    if (!d.name.trim()) e.push("Name is required");
+    const a = parseFloat(d.amount);
+    if (d.amount === "" || isNaN(a)) e.push("Amount must be a number");
+    else if (a === 0) e.push("Amount cannot be zero");
+    if (!d.date) e.push("Date is required");
+    return e;
+  }
+
+  // ── Responsive hook ───────────────────────────────────────────────────────────
+  function useWindowWidth() {
+    const [w, setW] = useState(window.innerWidth);
+    useEffect(() => {
+      const h = () => setW(window.innerWidth);
+      window.addEventListener("resize", h);
+      return () => window.removeEventListener("resize", h);
+    }, []);
+    return w;
+  }
+
+  // ── Shared styles ─────────────────────────────────────────────────────────────
+  const inp = {
+    background:"#0a0e1c", border:`1px solid ${C.border}`, borderRadius:6,
+    padding:"7px 10px", color:C.text, fontSize:13, fontFamily:"'Sora',sans-serif",
+    outline:"none", width:"100%", boxSizing:"border-box",
+  };
+  const btnPrimary = {
+    background:C.blue, border:"none", borderRadius:6, padding:"7px 16px",
+    color:"#0a0e1c", fontSize:12, cursor:"pointer", fontFamily:"'Sora',sans-serif", fontWeight:600,
+  };
+  const btnGhost = {
+    background:"transparent", border:`1px solid ${C.border}`, borderRadius:6,
+    padding:"6px 13px", color:C.muted, fontSize:12, cursor:"pointer", fontFamily:"'Sora',sans-serif",
+  };
+  const iconBtn = {
+    background:"none", border:"none", cursor:"pointer", color:C.muted,
+    padding:2, lineHeight:0, display:"inline-flex", alignItems:"center",
+  };
+
+  // ── SVG icons ─────────────────────────────────────────────────────────────────
+  const I = {
+    Plus:    ({s=13,c})=> <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke={c||"currentColor"} strokeWidth="2.5" strokeLinecap="round"><line x1="12" y1="4" x2="12" y2="20"/><line x1="4" y1="12" x2="20" y2="12"/></svg>,
+    Trash:   ({s=13})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3,6 5,6 21,6"/><path d="M19,6v14a2,2,0,0,1-2,2H7a2,2,0,0,1-2-2V6m3,0V4a1,1,0,0,1,1-1h4a1,1,0,0,1,1,1v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>,
+    Download:({s=12})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+    Upload:  ({s=12})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17,8 12,3 7,8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>,
+    Warn:    ({s=12,c})=> <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke={c||C.amber} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>,
+    Eye:     ({s=13})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
+    EyeOff:  ({s=13})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>,
+    Pencil:  ({s=12})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
+    Tilde:   ({s=11})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke={C.amber} strokeWidth="2.5" strokeLinecap="round"><path d="M4 12c2-4 6-4 8 0s6 4 8 0"/></svg>,
+    Check:   ({s=12})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke={C.green} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20,6 9,17 4,12"/></svg>,
+    Refresh: ({s=13})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23,4 23,10 17,10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>,
+    X:       ({s=12})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
+    Clock:   ({s=12})  => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12,6 12,12 16,14"/></svg>,
+  };
+
+  // ── Toggle ────────────────────────────────────────────────────────────────────
+  function Toggle({ on, onChange, label }) {
+    return (
+      <label style={{ display:"flex", alignItems:"center", gap:9, cursor:"pointer", userSelect:"none" }}>
+        <div onClick={() => onChange(!on)} style={{
+          width:34, height:18, borderRadius:9, position:"relative", cursor:"pointer",
+          background:on ? C.blue : C.border, transition:"background 0.15s", flexShrink:0,
+        }}>
+          <div style={{ position:"absolute", top:2, left:on?16:2, width:14, height:14,
+            borderRadius:"50%", background:"#fff", transition:"left 0.15s" }} />
+        </div>
+        <span style={{ fontSize:12, color:on ? C.text : C.muted }}>{label}</span>
+      </label>
+    );
+  }
+
+  // ── Validation error list ─────────────────────────────────────────────────────
+  function FormErrors({ errors }) {
+    if (!errors?.length) return null;
+    return (
+      <div style={{ background:"rgba(251,113,133,0.08)", border:`1px solid rgba(251,113,133,0.25)`,
+        borderRadius:6, padding:"8px 12px" }}>
+        {errors.map((e,i) => (
+          <div key={i} style={{ fontSize:12, color:C.red, display:"flex", alignItems:"center", gap:6,
+            marginTop:i>0?3:0 }}>
+            <span style={{fontSize:10,flexShrink:0}}>✕</span>{e}
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  // ── Undo toast ────────────────────────────────────────────────────────────────
+  function UndoToast({ item, onUndo, onDismiss }) {
+    if (!item) return null;
+    return (
+      <div style={{
+        position:"fixed", bottom:24, left:"50%", transform:"translateX(-50%)",
+        background:C.card, border:`1px solid ${C.border}`, borderRadius:10,
+        padding:"12px 16px", display:"flex", alignItems:"center", gap:14,
+        boxShadow:"0 8px 32px rgba(0,0,0,0.5)", zIndex:1000, whiteSpace:"nowrap",
+        fontFamily:"'Sora',sans-serif",
+      }}>
+        <span style={{ fontSize:12, color:C.text }}>"{item.name}" deleted</span>
+        <button onClick={onUndo} style={{ ...btnPrimary, padding:"4px 12px", fontSize:11 }}>
+          Undo
+        </button>
+        <button onClick={onDismiss} style={iconBtn}><I.X /></button>
+      </div>
+    );
+  }
+
+
+  // ── Help modal ────────────────────────────────────────────────────────────────
+  const HELP_SECTIONS = [
+    {
+      icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.indigo} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>,
+      title: "The forecast chart",
+      body: "The blue curve shows your projected account balance day by day over 30, 60, or 90 days. Hover any point to see which transactions land on that date. The amber dashed line is your warning threshold — dipping below it flags a risk period.",
+    },
+    {
+      icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.green} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>,
+      title: "Starting balance",
+      body: "Set this to your actual account balance right now. All forecasts flow from this anchor. Use Reconcile whenever you want to re-anchor it to reality — it records the date and an optional note.",
+    },
+    {
+      icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>,
+      title: "Recurring items",
+      body: "Add anything on a regular schedule — paycheques, mortgage, utilities, subscriptions. Set the frequency, next occurrence, and an optional end date. Toggle items off with the eye icon to exclude them without deleting.",
+    },
+    {
+      icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.amber} strokeWidth="2.5" strokeLinecap="round"><path d="M4 12c2-4 6-4 8 0s6 4 8 0"/></svg>,
+      title: "Variable amounts",
+      body: 'Mark a recurring item as Variable when the amount changes month to month — credit card payments are a good example. Set a typical estimate as the default, then pin specific values for upcoming months using the "amounts" button. The ~ marker shows where estimates are in use.',
+    },
+    {
+      icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.indigo} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>,
+      title: "One-time items",
+      body: "Add known upcoming expenses that don't repeat — a tax installment, a repair, a trip deposit. They appear in the Upcoming panel and are applied on their exact date. Past items collapse automatically.",
+    },
+    {
+      icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.green} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23,4 23,10 17,10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>,
+      title: "Reconcile regularly",
+      body: "Forecasts drift as actual spending varies from estimates. Hit Reconcile every week or two, enter your real bank balance, and the forecast re-anchors from there. The header shows how long ago you last reconciled — amber means it's time.",
+    },
+    {
+      icon: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>,
+      title: "Backup & Restore",
+      body: "All data lives in your browser's localStorage — it persists across sessions but can be cleared by browser privacy settings. Use Backup to export a JSON file regularly and Restore to reload it on any browser. A reminder appears when your backup is more than 7 days old.",
+    },
+  ];
+
+  function HelpModal({ onClose }) {
+    return (
+      <div
+        onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+        style={{
+          position:"fixed", inset:0, background:"rgba(4,7,18,0.9)",
+          display:"flex", alignItems:"flex-start", justifyContent:"center",
+          zIndex:500, padding:"24px 16px", overflowY:"auto",
+        }}>
+        <div style={{
+          background:C.card, border:`1px solid ${C.border}`,
+          borderRadius:16, width:"100%", maxWidth:540,
+          boxShadow:"0 24px 64px rgba(0,0,0,0.6)", overflow:"hidden",
+          marginBottom:24,
+        }}>
+          {/* Header */}
+          <div style={{ padding:"22px 24px 16px", borderBottom:`1px solid ${C.border}`,
+            display:"flex", alignItems:"flex-start", justifyContent:"space-between" }}>
+            <div>
+              <div style={{ fontSize:22, fontWeight:700, letterSpacing:"-0.03em",
+                background:`linear-gradient(90deg, ${C.indigo}, ${C.blue})`,
+                WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent", marginBottom:6 }}>
+                Flowcast
+              </div>
+              <div style={{ fontSize:13, color:C.muted, lineHeight:1.55 }}>
+                See what's coming financially — before it arrives.
+                <br/>A lightweight cashflow forecasting tool for your family.
+              </div>
+            </div>
+            <button onClick={onClose} style={{...iconBtn, marginLeft:16, flexShrink:0}}><I.X s={15}/></button>
+          </div>
+
+          {/* Sections */}
+          <div style={{ padding:"4px 0" }}>
+            {HELP_SECTIONS.map((s, i) => (
+              <div key={i} style={{
+                display:"flex", gap:14, padding:"13px 24px",
+                borderBottom:i < HELP_SECTIONS.length-1 ? `1px solid ${C.border}` : "none",
+              }}>
+                <div style={{ flexShrink:0, marginTop:2 }}>{s.icon}</div>
+                <div>
+                  <div style={{ fontSize:13, fontWeight:500, color:"#d6e4fa", marginBottom:4 }}>{s.title}</div>
+                  <div style={{ fontSize:12, color:C.muted, lineHeight:1.65 }}>{s.body}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Footer */}
+          <div style={{ padding:"14px 24px", borderTop:`1px solid ${C.border}`,
+            display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, flexWrap:"wrap" }}>
+            <div style={{ fontSize:11, color:C.muted }}>
+              Press{" "}
+              <kbd style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:4,
+                padding:"1px 6px", fontSize:10, color:C.text, fontFamily:"'DM Mono',monospace" }}>?</kbd>
+              {" "}anytime to reopen this guide
+            </div>
+            <button style={btnPrimary} onClick={onClose}>Got it</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Overrides panel ───────────────────────────────────────────────────────────
+  function OverridesPanel({ item, onUpdate }) {
+    const months = nextMonths(6);
+    const initDraft = () => {
+      const d = {};
+      months.forEach(m => {
+        const ov = (item.overrides||[]).find(o => o.month === m);
+        d[m] = ov !== undefined ? String(ov.amount) : "";
+      });
+      return d;
+    };
+    const [draft, setDraft] = useState(initDraft);
+    function save() {
+      const newOvs = months
+        .filter(m => draft[m] !== "" && draft[m] !== undefined)
+        .map(m => ({ month:m, amount:parseFloat(draft[m]) }))
+        .filter(o => !isNaN(o.amount));
+      const kept = (item.overrides||[]).filter(o => !months.includes(o.month));
+      onUpdate([...kept, ...newOvs]);
+    }
+    return (
+      <div style={{ background:"#060a12", border:`1px solid ${C.border}`,
+        borderRadius:8, padding:14, marginTop:4 }}>
+        <div style={{ fontSize:11, color:C.muted, marginBottom:10 }}>
+          Specific amounts by month — blank uses the estimate ({fmtBal(item.amount)})
+        </div>
+        <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
+          {months.map(m => (
+            <div key={m} style={{ display:"flex", alignItems:"center", gap:10 }}>
+              <span style={{ fontSize:12, color:C.muted, width:70, flexShrink:0 }}>{fmtMonth(m)}</span>
+              <input type="number" placeholder={`est. ${item.amount}`} value={draft[m]??""}
+                onChange={e => setDraft(d => ({...d,[m]:e.target.value}))}
+                style={{ ...inp, width:110, fontFamily:"'DM Mono',monospace", fontSize:12 }} />
+              {draft[m] !== "" && draft[m] !== undefined && !isNaN(parseFloat(draft[m])) && (
+                <span style={{ fontSize:11, fontFamily:"'DM Mono',monospace",
+                  color:parseFloat(draft[m])>0?C.green:C.red }}>
+                  {fmtBal(parseFloat(draft[m]))}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+        <button style={{ ...btnPrimary, marginTop:12 }} onClick={save}>Save amounts</button>
+      </div>
+    );
+  }
+
+  // ── Recurring form ────────────────────────────────────────────────────────────
+  function RecurringForm({ data, onChange, onSave, onCancel, saveLabel }) {
+    const [errors, setErrors] = useState([]);
+    const isBm = data.frequency === "bimonthly";
+    const bmDays = data.bimonthlyDays ?? [1, 15];
+    function setDay(idx, val) {
+      const next = [...bmDays];
+      next[idx] = Math.max(1, Math.min(31, parseInt(val)||1));
+      onChange({ ...data, bimonthlyDays:next });
+    }
+    function handleSave() {
+      const errs = validateRecurring(data);
+      if (errs.length) { setErrors(errs); return; }
+      setErrors([]);
+      onSave();
+    }
+    const clear = (update) => { onChange(update); setErrors([]); };
+    return (
+      <div style={{ background:"#090d1a", borderRadius:8, padding:14,
+        display:"flex", flexDirection:"column", gap:10, border:`1px solid ${C.border}` }}>
+        <input placeholder="Name" value={data.name}
+          onChange={e => clear({...data, name:e.target.value})} style={inp} />
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+          <div style={{ flex:"1 1 140px" }}>
+            <div style={{ fontSize:10, color:C.muted, marginBottom:4 }}>
+              {data.variable ? "Typical / estimated amount" : "Amount (– for expense)"}
+            </div>
+            <input type="number" value={data.amount}
+              onChange={e => clear({...data, amount:e.target.value})} style={inp} />
+          </div>
+          <div style={{ flex:"1 1 120px" }}>
+            <div style={{ fontSize:10, color:C.muted, marginBottom:4 }}>Frequency</div>
+            <select value={data.frequency}
+              onChange={e => onChange({...data, frequency:e.target.value,
+                bimonthlyDays:e.target.value==="bimonthly"?(data.bimonthlyDays??[1,15]):data.bimonthlyDays})}
+              style={inp}>
+              {FREQS.map(f => <option key={f} value={f}>{f}</option>)}
+            </select>
+          </div>
+        </div>
+        {isBm && (
+          <div>
+            <div style={{ fontSize:10, color:C.muted, marginBottom:6 }}>Days of month</div>
+            <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+              <input type="number" min="1" max="31" value={bmDays[0]} onChange={e=>setDay(0,e.target.value)}
+                style={{ ...inp, width:64, textAlign:"center", fontFamily:"'DM Mono',monospace" }} />
+              <span style={{ color:C.muted }}>&amp;</span>
+              <input type="number" min="1" max="31" value={bmDays[1]} onChange={e=>setDay(1,e.target.value)}
+                style={{ ...inp, width:64, textAlign:"center", fontFamily:"'DM Mono',monospace" }} />
+              <span style={{ fontSize:11, color:C.muted }}>of each month</span>
+            </div>
+          </div>
+        )}
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+          <label style={{ flex:"1 1 140px" }}>
+            <div style={{ fontSize:10, color:C.muted, marginBottom:4 }}>{isBm?"Start from":"First / next occurrence"}</div>
+            <input type="date" value={data.nextDate}
+              onChange={e => clear({...data, nextDate:e.target.value})} style={inp} />
+          </label>
+          <label style={{ flex:"1 1 140px" }}>
+            <div style={{ fontSize:10, color:C.muted, marginBottom:4 }}>End date (optional)</div>
+            <input type="date" value={data.endDate||""}
+              onChange={e => clear({...data, endDate:e.target.value})} style={inp} />
+          </label>
+        </div>
+        <Toggle on={!!data.variable}
+          onChange={v => onChange({...data, variable:v, overrides:data.overrides??[]})}
+          label="Variable amount (estimate used when no specific amount set)" />
+        <Toggle on={!!data.businessDay}
+          onChange={v => onChange({...data, businessDay:v})}
+          label="Defer to next Monday if weekend" />
+        <FormErrors errors={errors} />
+        <div style={{ display:"flex", gap:8 }}>
+          <button style={btnPrimary} onClick={handleSave}>{saveLabel}</button>
+          <button style={btnGhost} onClick={onCancel}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── One-time form ─────────────────────────────────────────────────────────────
+  function OneTimeForm({ data, onChange, onSave, onCancel, saveLabel }) {
+    const [errors, setErrors] = useState([]);
+    function handleSave() {
+      const errs = validateOneTime(data);
+      if (errs.length) { setErrors(errs); return; }
+      setErrors([]);
+      onSave();
+    }
+    const clear = (update) => { onChange(update); setErrors([]); };
+    return (
+      <div style={{ background:"#090d1a", borderRadius:8, padding:14,
+        display:"flex", flexDirection:"column", gap:8, border:`1px solid ${C.border}` }}>
+        <input placeholder="Description" value={data.name}
+          onChange={e => clear({...data, name:e.target.value})} style={inp} />
+        <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+          <input placeholder="Amount (– for expense)" type="number" value={data.amount}
+            onChange={e => clear({...data, amount:e.target.value})}
+            style={{ ...inp, flex:"1 1 120px" }} />
+          <input type="date" value={data.date}
+            onChange={e => clear({...data, date:e.target.value})}
+            style={{ ...inp, flex:"1 1 120px" }} />
+        </div>
+        <FormErrors errors={errors} />
+        <div style={{ display:"flex", gap:8 }}>
+          <button style={btnPrimary} onClick={handleSave}>{saveLabel}</button>
+          <button style={btnGhost} onClick={onCancel}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Reconcile panel ───────────────────────────────────────────────────────────
+  function ReconcilePanel({ currentBal, forecastBal, lastRecon, onConfirm, onClose }) {
+    const [newBal, setNewBal] = useState(String(currentBal));
+    const [note, setNote] = useState("");
+    const [error, setError] = useState("");
+    function confirm() {
+      const v = parseFloat(newBal);
+      if (isNaN(v)) { setError("Enter a valid balance"); return; }
+      onConfirm(v, note.trim());
+    }
+    const drift = forecastBal - currentBal;
+    return (
+      <div style={{ background:C.card, border:`1px solid ${C.indigo}`,
+        borderRadius:12, padding:20, marginBottom:20 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:14 }}>
+          <div>
+            <div style={{ fontSize:14, fontWeight:500, color:"#d6e4fa" }}>Reconcile balance</div>
+            <div style={{ fontSize:11, color:C.muted, marginTop:3 }}>
+              Enter your actual account balance to re-anchor the forecast
+            </div>
+          </div>
+          <button onClick={onClose} style={iconBtn}><I.X s={14}/></button>
+        </div>
+
+        {Math.abs(drift) > 1 && (
+          <div style={{ background:"rgba(129,140,248,0.07)", borderRadius:8, padding:"10px 14px",
+            marginBottom:14, fontSize:12, color:C.muted, lineHeight:1.6 }}>
+            Forecast shows <span style={{ color:C.indigo, fontFamily:"'DM Mono',monospace" }}>
+              {fmtBal(forecastBal)}</span> for today vs. baseline of <span style={{
+              color:C.text, fontFamily:"'DM Mono',monospace" }}>{fmtBal(currentBal)}</span>.
+            {Math.abs(drift) > 50 && <span> Drift: <span style={{
+              color:Math.abs(drift)>300?C.amber:C.muted,
+              fontFamily:"'DM Mono',monospace" }}>{fmtDelta(drift)}</span>.</span>}
+          </div>
+        )}
+
+        <div style={{ display:"flex", gap:10, flexWrap:"wrap", alignItems:"flex-end" }}>
+          <label style={{ flex:"1 1 150px" }}>
+            <div style={{ fontSize:11, color:C.muted, marginBottom:5 }}>Actual balance today</div>
+            <input type="number" value={newBal}
+              onChange={e => { setNewBal(e.target.value); setError(""); }}
+              style={{ ...inp, fontFamily:"'DM Mono',monospace", fontSize:15 }} />
+          </label>
+          <label style={{ flex:"2 1 180px" }}>
+            <div style={{ fontSize:11, color:C.muted, marginBottom:5 }}>Note (optional)</div>
+            <input value={note} onChange={e => setNote(e.target.value)}
+              placeholder='e.g. "post-payroll May 1"' style={inp} />
+          </label>
+        </div>
+        {error && <div style={{ fontSize:12, color:C.red, marginTop:8 }}>{error}</div>}
+        <div style={{ display:"flex", gap:8, marginTop:14 }}>
+          <button style={btnPrimary} onClick={confirm}>
+            <span style={{ display:"inline-flex", alignItems:"center", gap:6 }}>
+              <I.Check />Confirm
+            </span>
+          </button>
+          <button style={btnGhost} onClick={onClose}>Cancel</button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Chart tooltip ─────────────────────────────────────────────────────────────
+  function ChartTooltip({ active, payload }) {
+    if (!active || !payload?.length) return null;
+    const { date, balance, events } = payload[0].payload;
+    return (
+      <div style={{ background:"#0b1122", border:`1px solid ${C.border}`,
+        borderRadius:8, padding:"12px 16px", minWidth:190 }}>
+        <div style={{ fontSize:11, color:C.muted, marginBottom:6, fontFamily:"'DM Mono',monospace" }}>
+          {fmtDate(date)}
+        </div>
+        <div style={{ fontFamily:"'DM Mono',monospace", fontSize:20,
+          color:balance<0?C.red:C.green, marginBottom:events.length?10:0 }}>
+          {fmtBal(balance)}
+        </div>
+        {events.map((e,i) => (
+          <div key={i} style={{ display:"flex", justifyContent:"space-between", gap:16, fontSize:12,
+            paddingTop:i===0?2:4, borderTop:i===0?`1px solid ${C.border}`:"none" }}>
+            <span style={{ color:C.text }}>
+              {e.variable && <span style={{ color:C.amber, marginRight:3 }}>~</span>}{e.name}
+            </span>
+            <span style={{ fontFamily:"'DM Mono',monospace", color:e.amount>0?C.green:C.red }}>
+              {fmtDelta(e.amount)}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  // ── Stat card ─────────────────────────────────────────────────────────────────
+  function StatCard({ label, value, sub, accent, mobile }) {
+    return (
+      <div style={{ background:C.card, border:`1px solid ${C.border}`,
+        borderRadius:10, padding:mobile?"12px 14px":"14px 18px", flex:1, minWidth:mobile?120:130 }}>
+        <div style={{ fontSize:mobile?9:10, color:C.muted, textTransform:"uppercase",
+          letterSpacing:"0.08em", marginBottom:6 }}>{label}</div>
+        <div style={{ fontFamily:"'DM Mono',monospace", fontSize:mobile?17:20, fontWeight:500,
+          color:accent||C.text, lineHeight:1 }}>{value}</div>
+        {sub && <div style={{ fontSize:10, color:C.muted, marginTop:5 }}>{sub}</div>}
+      </div>
+    );
+  }
+
+  function recurringSubtitle(item) {
+    const parts = [];
+    if (item.frequency==="bimonthly"&&item.bimonthlyDays)
+      parts.push(`days ${item.bimonthlyDays[0]} & ${item.bimonthlyDays[1]}`);
+    else parts.push(item.frequency);
+    if (item.businessDay) parts.push("→ Mon if wknd");
+    parts.push(`next ${fmtDate(item.nextDate)}`);
+    if (item.endDate) parts.push(`ends ${fmtDate(item.endDate)}`);
+    return parts.join(" · ");
+  }
+
+  // ── App ───────────────────────────────────────────────────────────────────────
+  function Cashflow() {
+    const w = useWindowWidth();
+    const mobile = w < 600;
+
+    // ── Persisted state
+    const [recurring,  setRecurring]  = useState(() => lsGet("cf_recurring",  DEMO_RECURRING));
+    const [oneTime,    setOneTime]    = useState(() => lsGet("cf_onetime",    DEMO_ONETIME));
+    const [startBal,   setStartBal]   = useState(() => lsGet("cf_startbal",   3200));
+    const [threshold,  setThreshold]  = useState(() => lsGet("cf_threshold",  500));
+    const [days,       setDays]       = useState(() => lsGet("cf_days",       90));
+    const [lastRecon,  setLastRecon]  = useState(() => lsGet("cf_lastRecon",  null));
+    // lastRecon: { date, balance, note } | null
+
+    // Save flash
+    const [savedFlash, setSavedFlash] = useState(false);
+    const flashRef = useRef();
+    function flashSaved() {
+      setSavedFlash(true);
+      clearTimeout(flashRef.current);
+      flashRef.current = setTimeout(() => setSavedFlash(false), 1500);
+    }
+    useEffect(() => { lsSet("cf_recurring", recurring); flashSaved(); }, [recurring]);
+    useEffect(() => { lsSet("cf_onetime",   oneTime);   flashSaved(); }, [oneTime]);
+    useEffect(() => { lsSet("cf_startbal",  startBal);  }, [startBal]);
+    useEffect(() => { lsSet("cf_threshold", threshold); }, [threshold]);
+    useEffect(() => { lsSet("cf_days",      days);      }, [days]);
+    useEffect(() => { lsSet("cf_lastRecon", lastRecon); }, [lastRecon]);
+
+    // ── Undo
+    const [undoItem,  setUndoItem]  = useState(null);
+    const undoTimer = useRef();
+    function triggerUndo(type, item) {
+      clearTimeout(undoTimer.current);
+      setUndoItem({ type, item });
+      undoTimer.current = setTimeout(() => setUndoItem(null), 5000);
+    }
+    function doUndo() {
+      if (!undoItem) return;
+      clearTimeout(undoTimer.current);
+      if (undoItem.type === "r") setRecurring(r => [...r, undoItem.item]);
+      else setOneTime(o => [...o, undoItem.item]);
+      setUndoItem(null);
+    }
+
+    // ── UI state
+    const emptyR = { name:"", amount:"", frequency:"monthly", nextDate:todayStr(), endDate:"", businessDay:false, bimonthlyDays:[1,15], variable:false, overrides:[] };
+    const emptyO = { name:"", amount:"", date:todayStr() };
+    const [showAddR,      setShowAddR]      = useState(false);
+    const [showAddO,      setShowAddO]      = useState(false);
+    const [newR,          setNewR]          = useState(emptyR);
+    const [newO,          setNewO]          = useState(emptyO);
+    const [editing,       setEditing]       = useState(null);
+    const [showOverride,  setShowOverride]  = useState(null);
+    const [showRecon,     setShowRecon]     = useState(false);
+    const [showPast,      setShowPast]      = useState(false);
+    const [backupDismiss, setBackupDismiss] = useState(false);
+    const [showHelp,      setShowHelp]      = useState(() => !lsGet("cf_visited", false));
+    function openHelp()  { setShowHelp(true); }
+    function closeHelp() { lsSet("cf_visited", true); setShowHelp(false); }
+
+    const backupRef = useRef();
+    const start = todayStr();
+
+    // ── Forecast
+    const forecast = useMemo(
+      () => buildForecast(startBal, start, recurring, oneTime, days),
+      [startBal, recurring, oneTime, days]
+    );
+    const stats = useMemo(() => {
+      const minEntry = forecast.reduce((m,d) => d.balance < m.balance ? d : m, forecast[0]);
+      const net = (forecast[forecast.length-1]?.balance ?? startBal) - startBal;
+      const low = forecast.filter(d => d.balance < threshold);
+      return { minEntry, net, low };
+    }, [forecast, threshold, startBal]);
+
+    // Today's forecast value for reconcile drift
+    const todayForecastBal = useMemo(() => {
+      const row = forecast.find(r => r.date === start);
+      return row ? row.balance : startBal;
+    }, [forecast, start, startBal]);
+
+    const chartData = useMemo(() => {
+      const step = days<=30?1:days<=60?2:3;
+      return forecast.filter((_,i) => i%step===0 || i===forecast.length-1);
+    }, [forecast, days]);
+    const yMin = useMemo(() => Math.min(Math.min(...chartData.map(d=>d.balance)),0)-200,[chartData]);
+    const yMax = useMemo(() => Math.max(...chartData.map(d=>d.balance))*1.06,[chartData]);
+
+    const today = start;
+    const upcomingOT = useMemo(() => oneTime.filter(o => o.date >= today), [oneTime]);
+    const pastOT     = useMemo(() => oneTime.filter(o => o.date <  today), [oneTime]);
+
+    const upcoming = useMemo(() =>
+      forecast.filter(d => d.events.length > 0)
+        .flatMap(d => d.events.map(e => ({...e, date:d.date, after:d.balance})))
+        .slice(0, 18),
+      [forecast]
+    );
+
+    // Backup reminder
+    const lastBackupDate = lsGet("cf_lastBackup", null);
+    const backupAge = daysAgo(lastBackupDate);
+    const showBackupBanner = !backupDismiss && (lastBackupDate === null || backupAge > 7);
+
+    // ── Handlers
+    function addR() {
+      setRecurring(r => [...r, {...newR, id:uid(), amount:parseFloat(newR.amount), active:true}]);
+      setNewR(emptyR); setShowAddR(false);
+    }
+    function addO() {
+      setOneTime(o => [...o, {...newO, id:uid(), amount:parseFloat(newO.amount)}]);
+      setNewO(emptyO); setShowAddO(false);
+    }
+    function saveEdit() {
+      if (!editing) return;
+      if (editing.type === "r")
+        setRecurring(r => r.map(x => x.id===editing.id ? {...editing.data, amount:parseFloat(editing.data.amount)} : x));
+      else
+        setOneTime(o => o.map(x => x.id===editing.id ? {...editing.data, amount:parseFloat(editing.data.amount)} : x));
+      setEditing(null);
+    }
+    function startEdit(type, item) {
+      setEditing({type, id:item.id, data:{...item, amount:String(item.amount)}});
+      setShowAddR(false); setShowAddO(false); setShowOverride(null);
+    }
+    function deleteR(item) { setRecurring(r => r.filter(x => x.id!==item.id)); triggerUndo("r", item); }
+    function deleteO(item) { setOneTime(o => o.filter(x => x.id!==item.id));   triggerUndo("o", item); }
+    function updateOverrides(id, ovs) { setRecurring(r => r.map(x => x.id===id ? {...x,overrides:ovs} : x)); }
+    function confirmReconcile(bal, note) {
+      setStartBal(bal);
+      setLastRecon({ date:todayStr(), balance:bal, note });
+      setShowRecon(false);
+    }
+    function exportBackup() {
+      const payload = { version:1, exportedAt:new Date().toISOString(),
+        settings:{startBal,threshold,days}, recurring, oneTime };
+      const blob = new Blob([JSON.stringify(payload,null,2)], {type:"application/json"});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href=url; a.download=`cashflow-${todayStr()}.json`; a.click();
+      URL.revokeObjectURL(url);
+      lsSet("cf_lastBackup", new Date().toISOString());
+      setBackupDismiss(true);
+    }
+    function handleRestore(e) {
+      const file = e.target.files[0]; if (!file) return;
+      const reader = new FileReader();
+      reader.onload = ev => {
+        try {
+          const data = JSON.parse(ev.target.result);
+          if (!data.recurring && !data.oneTime) { alert("Unrecognised backup format."); return; }
+          if (!confirm("Replace all current data with this backup?")) return;
+          if (data.recurring)           setRecurring(data.recurring);
+          if (data.oneTime)             setOneTime(data.oneTime);
+          if (data.settings?.startBal)  setStartBal(data.settings.startBal);
+          if (data.settings?.threshold) setThreshold(data.settings.threshold);
+          if (data.settings?.days)      setDays(data.settings.days);
+        } catch { alert("Could not read file."); }
+      };
+      reader.readAsText(file); e.target.value = "";
+    }
+    function resetToDemo() {
+      if (!confirm("Reset everything to demo data?")) return;
+      setRecurring(DEMO_RECURRING); setOneTime(DEMO_ONETIME);
+      setStartBal(3200); setThreshold(500); setLastRecon(null);
+    }
+
+    const minAccent = stats.minEntry.balance<threshold ? C.red
+      : stats.minEntry.balance<threshold*2 ? C.amber : C.green;
+
+    // Reconcile header info
+    const daysSinceRecon = lastRecon ? daysAgo(lastRecon.date) : null;
+    const reconNote = lastRecon
+      ? `reconciled ${fmtDateFull(lastRecon.date)}${lastRecon.note ? ` · ${lastRecon.note}` : ""}`
+      : "never reconciled";
+    const reconColor = (daysSinceRecon === null || daysSinceRecon > 7) ? C.amber : C.muted;
+
+    const pad = mobile ? "14px 12px 40px" : "28px 28px 48px";
+
+    // ── Item row helpers
+    function RecurringRow({ item }) {
+      const isEditing  = editing?.type==="r" && editing.id===item.id;
+      const isOverride = showOverride === item.id;
+      if (isEditing) return (
+        <div style={{marginBottom:4}}>
+          <RecurringForm data={editing.data}
+            onChange={d => setEditing(e => ({...e,data:d}))}
+            onSave={saveEdit} onCancel={() => setEditing(null)} saveLabel="Save" />
+        </div>
+      );
+      return (
+        <div>
+          <div style={{
+            display:"flex", alignItems:"center", justifyContent:"space-between",
+            padding:"8px 10px", borderRadius:7,
+            border:`1px solid ${item.active ? C.border : "transparent"}`,
+            opacity:item.active ? 1 : 0.4,
+            background:isOverride ? "#0b1020" : "transparent",
+          }}>
+            <div style={{flex:1, minWidth:0}}>
+              <div style={{display:"flex", alignItems:"center", gap:6}}>
+                {item.variable && <I.Tilde/>}
+                <span style={{fontSize:13, color:item.active?C.text:C.muted,
+                  overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                  {item.name}
+                </span>
+                {item.variable && (item.overrides?.length > 0) && (
+                  <span style={{fontSize:10, color:C.indigo,
+                    background:"rgba(129,140,248,0.12)", borderRadius:4, padding:"1px 5px", flexShrink:0}}>
+                    {item.overrides.length}✕
+                  </span>
+                )}
+              </div>
+              <div style={{fontSize:10, color:C.muted, marginTop:2,
+                overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                {recurringSubtitle(item)}
+              </div>
+            </div>
+            <div style={{display:"flex", alignItems:"center", gap:mobile?4:7, flexShrink:0, marginLeft:6}}>
+              <span style={{fontFamily:"'DM Mono',monospace", fontSize:mobile?11:13,
+                color:item.amount>0?C.green:C.red}}>
+                {item.variable?"~":""}{fmtBal(item.amount)}
+              </span>
+              {item.variable && (
+                <button
+                  onClick={() => setShowOverride(v => v===item.id ? null : item.id)}
+                  style={{...iconBtn, fontSize:10, padding:"2px 6px",
+                    border:`1px solid ${isOverride?C.amber:C.border}`,
+                    borderRadius:5, color:isOverride?C.amber:C.muted}}>
+                  {mobile?"$":"amounts"}
+                </button>
+              )}
+              <button onClick={() => startEdit("r", item)} style={iconBtn}><I.Pencil/></button>
+              <button onClick={() => setRecurring(r => r.map(x => x.id===item.id?{...x,active:!x.active}:x))} style={iconBtn}>
+                {item.active ? <I.Eye/> : <I.EyeOff/>}
+              </button>
+              <button onClick={() => deleteR(item)} style={iconBtn}><I.Trash/></button>
+            </div>
+          </div>
+          {isOverride && <OverridesPanel item={item} onUpdate={ovs => updateOverrides(item.id, ovs)} />}
+        </div>
+      );
+    }
+
+    function OTRow({ item, showEdit=true }) {
+      const isEditing = editing?.type==="o" && editing.id===item.id;
+      if (isEditing) return (
+        <div style={{marginBottom:8}}>
+          <OneTimeForm data={editing.data}
+            onChange={d => setEditing(e => ({...e,data:d}))}
+            onSave={saveEdit} onCancel={() => setEditing(null)} saveLabel="Save" />
+        </div>
+      );
+      return (
+        <div style={{display:"flex", justifyContent:"space-between", alignItems:"center",
+          padding:"6px 0", borderBottom:`1px solid ${C.border}`}}>
+          <div>
+            <div style={{fontSize:12, color:C.text}}>{item.name}</div>
+            <div style={{fontSize:10, color:C.muted}}>{fmtDate(item.date)}</div>
+          </div>
+          <div style={{display:"flex", gap:8, alignItems:"center"}}>
+            <span style={{fontFamily:"'DM Mono',monospace", fontSize:12,
+              color:item.amount>0?C.green:C.red}}>{fmtDelta(item.amount)}</span>
+            {showEdit && <button onClick={() => startEdit("o", item)} style={iconBtn}><I.Pencil/></button>}
+            <button onClick={() => deleteO(item)} style={iconBtn}><I.Trash/></button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── Render ────────────────────────────────────────────────────────────────
+    return (
+      <div style={{fontFamily:"'Sora',sans-serif", background:C.bg, minHeight:"100vh",
+        color:C.text, padding:pad, boxSizing:"border-box"}}>
+
+        {/* Backup reminder */}
+        {showBackupBanner && (
+          <div style={{background:"rgba(251,191,36,0.07)", border:`1px solid rgba(251,191,36,0.22)`,
+            borderRadius:10, padding:"10px 14px", marginBottom:14,
+            display:"flex", alignItems:"center", justifyContent:"space-between", gap:10, flexWrap:"wrap"}}>
+            <div style={{display:"flex", alignItems:"center", gap:8, fontSize:12, color:C.amber}}>
+              <I.Warn/>
+              {lastBackupDate === null
+                ? "No backup yet — export JSON to protect your data"
+                : `Last backup ${backupAge} days ago — consider a fresh export`}
+            </div>
+            <div style={{display:"flex", gap:8}}>
+              <button style={{...btnPrimary, background:C.amber, padding:"4px 12px", fontSize:11}} onClick={exportBackup}>
+                Back up now
+              </button>
+              <button style={iconBtn} onClick={() => setBackupDismiss(true)}><I.X/></button>
+            </div>
+          </div>
+        )}
+
+        {/* Header */}
+        <div style={{display:"flex", alignItems:"flex-start", justifyContent:"space-between",
+          marginBottom:18, flexWrap:"wrap", gap:10}}>
+          <div>
+            <div style={{display:"flex", alignItems:"baseline", gap:10}}>
+              <h1 style={{margin:0, fontSize:mobile?18:22, fontWeight:700, letterSpacing:"-0.03em",
+                background:`linear-gradient(90deg, ${C.indigo}, ${C.blue})`,
+                WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent"}}>
+                Flowcast
+              </h1>
+              {savedFlash && <span style={{fontSize:10, color:C.green}}>● saved</span>}
+            </div>
+            <div style={{fontSize:10, marginTop:3, color:reconColor}}>
+              {reconNote}
+            </div>
+          </div>
+
+          {/* Controls */}
+          <div style={{display:"flex", alignItems:"center", gap:8, flexWrap:"wrap"}}>
+            <label style={{display:"flex", alignItems:"center", gap:6, fontSize:12, color:C.muted}}>
+              {mobile?"Bal.":"Balance"}
+              <input type="number" value={startBal} onChange={e=>setStartBal(parseFloat(e.target.value)||0)}
+                style={{...inp, width:mobile?82:96, textAlign:"right", fontFamily:"'DM Mono',monospace"}}/>
+            </label>
+            <label style={{display:"flex", alignItems:"center", gap:6, fontSize:12, color:C.muted}}>
+              {mobile?"Warn":"Warn below"}
+              <input type="number" value={threshold} onChange={e=>setThreshold(parseFloat(e.target.value)||0)}
+                style={{...inp, width:72, textAlign:"right", fontFamily:"'DM Mono',monospace"}}/>
+            </label>
+            <button
+              style={{...btnGhost, borderColor:showRecon?C.indigo:C.border, color:showRecon?C.indigo:C.muted}}
+              onClick={() => { setShowRecon(v=>!v); setShowAddR(false); setShowAddO(false); }}>
+              <span style={{display:"inline-flex",alignItems:"center",gap:5}}><I.Refresh/>Reconcile</span>
+            </button>
+            <button style={btnGhost} onClick={exportBackup}>
+              <span style={{display:"inline-flex",alignItems:"center",gap:5}}><I.Download/>{mobile?"":"Backup"}</span>
+            </button>
+            <button style={btnGhost} onClick={() => backupRef.current?.click()}>
+              <span style={{display:"inline-flex",alignItems:"center",gap:5}}><I.Upload/>{mobile?"":"Restore"}</span>
+            </button>
+            <input ref={backupRef} type="file" accept=".json" style={{display:"none"}} onChange={handleRestore}/>
+            <button style={{...iconBtn, border:`1px solid ${C.border}`, borderRadius:6,
+              padding:"5px 9px", color:C.muted, fontSize:13, fontWeight:600}}
+              onClick={openHelp} title="Help / how to use Flowcast">
+              ?
+            </button>
+          </div>
+        </div>
+
+        {/* Reconcile panel */}
+        {showRecon && (
+          <ReconcilePanel
+            currentBal={startBal}
+            forecastBal={todayForecastBal}
+            lastRecon={lastRecon}
+            onConfirm={confirmReconcile}
+            onClose={() => setShowRecon(false)}
+          />
+        )}
+
+        {/* Stat cards */}
+        <div style={{display:"flex", gap:8, marginBottom:18, flexWrap:"wrap"}}>
+          <StatCard label="Current balance" value={fmtBal(startBal)} mobile={mobile}/>
+          <StatCard label={`Projected low · ${days}d`} value={fmtBal(stats.minEntry.balance)}
+            sub={`on ${fmtDate(stats.minEntry.date)}`} accent={minAccent} mobile={mobile}/>
+          <StatCard label={`${days}-day net`} value={fmtDelta(stats.net)}
+            accent={stats.net>=0?C.green:C.red} mobile={mobile}/>
+          <StatCard label="Days below threshold" value={stats.low.length}
+            sub={stats.low.length>0?`first: ${fmtDate(stats.low[0].date)}`:"all clear ✓"}
+            accent={stats.low.length>0?C.amber:C.green} mobile={mobile}/>
+        </div>
+
+        {/* Range toggle */}
+        <div style={{display:"flex", gap:6, marginBottom:12}}>
+          {[30,60,90].map(d => (
+            <button key={d} onClick={()=>setDays(d)} style={{
+              background:days===d?C.indigo:"transparent",
+              border:`1px solid ${days===d?C.indigo:C.border}`,
+              borderRadius:6, padding:"5px 14px", color:days===d?"#fff":C.muted,
+              fontSize:12, cursor:"pointer", fontFamily:"'Sora',sans-serif",
+            }}>{d} days</button>
+          ))}
+        </div>
+
+        {/* Chart */}
+        <div style={{background:C.surface, border:`1px solid ${C.border}`,
+          borderRadius:12, padding:mobile?"14px 4px 8px 0":"20px 12px 10px 4px", marginBottom:18}}>
+          <ResponsiveContainer width="100%" height={mobile?165:220}>
+            <AreaChart data={chartData} margin={{top:6, right:mobile?4:16, left:0, bottom:0}}>
+              <defs>
+                <linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor={C.indigo} stopOpacity={0.35}/>
+                  <stop offset="90%" stopColor={C.indigo} stopOpacity={0.02}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke={C.border} strokeDasharray="4 4" vertical={false}/>
+              <XAxis dataKey="date" tickFormatter={fmtDate}
+                tick={{fill:C.muted, fontSize:mobile?9:10, fontFamily:"'DM Mono',monospace"}}
+                axisLine={{stroke:C.border}} tickLine={false} interval="preserveStartEnd"/>
+              <YAxis tickFormatter={v=>`$${(v/1000).toFixed(1)}k`}
+                tick={{fill:C.muted, fontSize:mobile?9:10, fontFamily:"'DM Mono',monospace"}}
+                axisLine={false} tickLine={false} domain={[yMin,yMax]} width={mobile?38:48}/>
+              <Tooltip content={<ChartTooltip/>}/>
+              <ReferenceLine y={threshold} stroke={C.amber} strokeDasharray="5 3" strokeWidth={1.5}
+                label={{value:"threshold",fill:C.amber,fontSize:9,dy:-7,fontFamily:"'DM Mono',monospace"}}/>
+              {yMin<0 && <ReferenceLine y={0} stroke={C.red} strokeWidth={1} strokeDasharray="3 3"/>}
+              <Area type="monotone" dataKey="balance" stroke={C.indigo} strokeWidth={2}
+                fill="url(#grad)" dot={false} activeDot={{r:4,fill:C.indigo,stroke:C.bg,strokeWidth:2}}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+
+        {/* Bottom panels */}
+        <div style={{display:"flex", gap:14, flexWrap:"wrap"}}>
+
+          {/* Recurring panel */}
+          <div style={{background:C.surface, border:`1px solid ${C.border}`,
+            borderRadius:12, padding:mobile?14:20, flex:"1 1 300px"}}>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14}}>
+              <span style={{fontSize:13, fontWeight:500, color:"#d6e4fa"}}>Recurring</span>
+              <div style={{display:"flex", gap:6}}>
+                {!mobile && (
+                  <button style={{...btnGhost,fontSize:11,padding:"4px 10px"}} onClick={resetToDemo}>
+                    reset demo
+                  </button>
+                )}
+                <button style={btnGhost} onClick={()=>{setShowAddR(v=>!v);setEditing(null);setShowOverride(null);}}>
+                  <span style={{display:"inline-flex",alignItems:"center",gap:4}}><I.Plus/>Add</span>
+                </button>
+              </div>
+            </div>
+
+            {showAddR && (
+              <div style={{marginBottom:14}}>
+                <RecurringForm data={newR} onChange={setNewR} onSave={addR}
+                  onCancel={()=>setShowAddR(false)} saveLabel="Add"/>
+              </div>
+            )}
+
+            <div style={{display:"flex", flexDirection:"column", gap:5}}>
+              {recurring.map(item => <RecurringRow key={item.id} item={item}/>)}
+            </div>
+
+            <div style={{marginTop:12, paddingTop:10, borderTop:`1px solid ${C.border}`,
+              fontSize:10, color:C.muted, display:"flex", alignItems:"center", gap:6}}>
+              <I.Tilde/> variable — estimate used when no specific amount set
+            </div>
+          </div>
+
+          {/* Upcoming panel */}
+          <div style={{background:C.surface, border:`1px solid ${C.border}`,
+            borderRadius:12, padding:mobile?14:20, flex:"1 1 300px"}}>
+            <div style={{display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14}}>
+              <span style={{fontSize:13, fontWeight:500, color:"#d6e4fa"}}>Upcoming</span>
+              <button style={btnGhost} onClick={()=>{setShowAddO(v=>!v);setEditing(null);}}>
+                <span style={{display:"inline-flex",alignItems:"center",gap:4}}><I.Plus/>One-time</span>
+              </button>
+            </div>
+
+            {showAddO && (
+              <div style={{marginBottom:14}}>
+                <OneTimeForm data={newO} onChange={setNewO} onSave={addO}
+                  onCancel={()=>setShowAddO(false)} saveLabel="Add"/>
+              </div>
+            )}
+
+            {/* Scheduled one-time items */}
+            {upcomingOT.length > 0 && (
+              <div style={{marginBottom:14, paddingBottom:10, borderBottom:`1px solid ${C.border}`}}>
+                <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",
+                  letterSpacing:"0.08em",marginBottom:8}}>Scheduled</div>
+                {upcomingOT.map(item => <OTRow key={item.id} item={item}/>)}
+              </div>
+            )}
+
+            {/* Past one-time items — collapsed */}
+            {pastOT.length > 0 && (
+              <div style={{marginBottom:14, paddingBottom:10, borderBottom:`1px solid ${C.border}`}}>
+                <button
+                  onClick={() => setShowPast(v=>!v)}
+                  style={{...iconBtn, fontSize:11, color:C.muted, gap:6, display:"flex",
+                    alignItems:"center", paddingBottom:8}}>
+                  <I.Clock s={11}/>
+                  {pastOT.length} past item{pastOT.length!==1?"s":""} {showPast?"▴":"▾"}
+                </button>
+                {showPast && (
+                  <div style={{opacity:0.55}}>
+                    {pastOT.map(item => <OTRow key={item.id} item={item} showEdit={false}/>)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Forecast transaction stream */}
+            <div style={{fontSize:10,color:C.muted,textTransform:"uppercase",
+              letterSpacing:"0.08em",marginBottom:8}}>Next transactions</div>
+            <div style={{display:"flex",flexDirection:"column",gap:4,
+              maxHeight:mobile?200:300, overflowY:"auto"}}>
+              {upcoming.map((e,i) => {
+                const warn = e.after < threshold;
+                return (
+                  <div key={i} style={{
+                    display:"flex",alignItems:"center",justifyContent:"space-between",
+                    padding:"7px 10px",borderRadius:7,border:`1px solid ${C.border}`,
+                    borderLeft:`3px solid ${e.amount>0?C.green:warn?C.red:C.border}`,
+                  }}>
+                    <div>
+                      <div style={{fontSize:12,color:C.text,display:"flex",alignItems:"center",gap:4}}>
+                        {e.variable && <span style={{color:C.amber,fontSize:11}}>~</span>}
+                        {e.name}
+                      </div>
+                      <div style={{fontSize:10,color:C.muted}}>
+                        {fmtDate(e.date)} · after: {fmtBal(e.after)}
+                      </div>
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <span style={{fontFamily:"'DM Mono',monospace",fontSize:12,
+                        color:e.amount>0?C.green:C.red}}>{fmtDelta(e.amount)}</span>
+                      {warn && <I.Warn/>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{marginTop:20,fontSize:10,color:C.muted,textAlign:"center",lineHeight:1.8}}>
+          Data saved in this browser's localStorage &nbsp;·&nbsp;
+          <strong style={{color:C.text}}>Backup</strong> exports JSON &nbsp;·&nbsp;
+          <strong style={{color:C.text}}>Restore</strong> reimports it on any browser
+        </div>
+
+        {/* Help modal */}
+        {showHelp && <HelpModal onClose={closeHelp}/>}
+
+        {/* Undo toast */}
+        <UndoToast
+          item={undoItem?.item ?? null}
+          onUndo={doUndo}
+          onDismiss={() => { clearTimeout(undoTimer.current); setUndoItem(null); }}
+        />
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(<Cashflow/>);
+</script>
+</body>
+</html>
